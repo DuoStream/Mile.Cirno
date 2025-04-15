@@ -34,6 +34,74 @@
 #include "Mile.Cirno.Core.h"
 #include "Mile.Cirno.Protocol.Parser.h"
 
+/// <summary>
+/// The log components.
+/// </summary>
+typedef enum
+{
+    Nothing = 0x0,
+    Errors = 0x1,
+    Warnings = 0x2,
+    Information = 0x4,
+    DebugData = 0x8,
+    Patches = 0x10,
+    Hooks = 0x20,
+    LightTraces = 0x40,
+    HeavyTraces = 0x80
+} LogComponents;
+
+/// <summary>
+/// The current log level.
+/// </summary>
+static LogComponents EnabledLogLevels = (LogComponents)(Errors | Warnings | Information);
+
+/// <summary>
+/// Logs a message to the Windows event log.
+/// </summary>
+/// <param name="type">EventLog type</param>
+/// <param name="logLevel">Log level</param>
+/// <param name="format">Format string</param>
+static BOOL Log(WORD type, LogComponents logLevel, const wchar_t* format, ...)
+{
+    // The result
+    BOOL result = FALSE;
+
+    // We want to see this log
+    if ((EnabledLogLevels & logLevel) != 0)
+    {
+        // Specify the source name for the event log.
+        LPCWSTR sourceName = L"Mile.Cirno";
+
+        // Register the event source
+        HANDLE eventSource = RegisterEventSourceW(NULL, sourceName);
+
+        // We managed to register the event source
+        if (eventSource != NULL)
+        {
+            // Determine how long the formatted message is in characters
+            va_list args;
+            va_start(args, format);
+            int length = _vscwprintf(format, args) + 1;
+            va_end(args);
+
+            // Allocate a buffer for the formatted message
+            wchar_t* logMessage = (wchar_t*)_alloca(length * sizeof(wchar_t));
+
+            // Format the log message.
+            va_start(args, format);
+            vswprintf_s(logMessage, length, format, args);
+            va_end(args);
+
+            // Log the message to the Application event log.
+            const wchar_t* messageStrings[1] = { logMessage };
+            result = ReportEventW(eventSource, type, 0, 1, NULL, 1, 0, messageStrings, NULL);
+        }
+    }
+
+    // Return the result
+    return result;
+}
+
 // Win32 time epoch is 00:00:00, January 1 1601.
 // UNIX time epoch is 00:00:00, January 1 1970.
 // There are 11644473600 seconds between these two epochs.
@@ -84,9 +152,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoZwCreateFile(
         &ConvertedFlagsAndAttributes,
         &ConvertedCreationDisposition);
 
-    std::wprintf(
-        L"[INFO] FileName = %s\n",
-        FileName);
+    Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"[DEBUG] FileName = %s\n", FileName);
 
     try
     {
@@ -168,7 +234,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoZwCreateFile(
     }
     catch (std::exception const& ex)
     {
-        std::printf("%s\n", ex.what());
+        Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"%hs\n", ex.what());
         return DokanFileInfo->IsDirectory
             ? STATUS_OBJECT_PATH_NOT_FOUND
             : STATUS_OBJECT_NAME_NOT_FOUND;
@@ -199,7 +265,7 @@ void DOKAN_CALLBACK MileCirnoCloseFile(
     }
     catch (std::exception const& ex)
     {
-        std::printf("%s\n", ex.what());
+        Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"%hs\n", ex.what());
     }
 }
 
@@ -256,7 +322,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoReadFile(
     }
     catch (std::exception const& ex)
     {
-        std::printf("%s\n", ex.what());
+        Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"%hs\n", ex.what());
         return STATUS_NOT_IMPLEMENTED;
     }
 
@@ -325,7 +391,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoGetFileInformation(
     }
     catch (std::exception const& ex)
     {
-        std::printf("%s\n", ex.what());
+        Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"%hs\n", ex.what());
         return STATUS_NOT_IMPLEMENTED;
     }
 
@@ -399,7 +465,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoFindFiles(
                             }
                             catch (std::exception const& ex)
                             {
-                                std::printf("%s\n", ex.what());
+                                Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"%hs\n", ex.what());
                             }
                             g_Instance->FreeFileId(WalkRequest.NewFileId);
                         }
@@ -436,7 +502,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoFindFiles(
                 }
                 catch (std::exception const& ex)
                 {
-                    std::printf("%s\n", ex.what());
+                    Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"%hs\n", ex.what());
                 }
 
                 FillFindData(&FindData, DokanFileInfo);
@@ -445,7 +511,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoFindFiles(
     }
     catch (std::exception const& ex)
     {
-        std::printf("%s\n", ex.what());
+        Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"%hs\n", ex.what());
         return STATUS_NOT_IMPLEMENTED;
     }
 
@@ -480,7 +546,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoGetDiskFreeSpace(
     }
     catch (std::exception const& ex)
     {
-        std::printf("%s\n", ex.what());
+        Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"%hs\n", ex.what());
         return STATUS_NOT_IMPLEMENTED;
     }
 
@@ -489,11 +555,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoGetDiskFreeSpace(
 
 int main()
 {
-    ::std::printf(
-        "Mile.Cirno " MILE_PROJECT_VERSION_UTF8_STRING " (Build "
-        MILE_PROJECT_MACRO_TO_UTF8_STRING(MILE_PROJECT_VERSION_BUILD) ")" "\n"
-        "(c) Kenji Mouri. All rights reserved.\n"
-        "\n");
+    Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"Mile.Cirno %hs (Build %hs)\n(c) Kenji Mouri. All rights reserved.\n\n", MILE_PROJECT_VERSION_UTF8_STRING, MILE_PROJECT_MACRO_TO_UTF8_STRING(MILE_PROJECT_VERSION_BUILD));
 
     std::vector<std::string> Arguments = Mile::SplitCommandLineString(
         Mile::ToString(CP_UTF8, ::GetCommandLineW()));
@@ -507,11 +569,7 @@ int main()
 
     if (Arguments.empty() || 1 == Arguments.size())
     {
-        std::printf(
-            "[INFO] Mile.Cirno will run as the NanaBox EnableHostDriverStore "
-            "integration mode.\n"
-            "[INFO] Use \"Mile.Cirno Help\" for more commands.\n"
-            "\n");
+        Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"[INFO] Mile.Cirno will run as the NanaBox EnableHostDriverStore integration mode.\n[INFO] Use \"Mile.Cirno Help\" for more commands.\n\n");
 
         ParseSuccess = true;
         Host = "HvSocket";
@@ -555,38 +613,36 @@ int main()
     if (!ParseSuccess)
     {
         ShowHelp = true;
-        std::printf(
-            "[ERROR] Unrecognized command.\n"
-            "\n");
+        Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"[ERROR] Unrecognized command.\n\n");
     }
 
     if (ShowHelp)
     {
-        std::printf(
-            "Format: Mile.Cirno [Command] <Option1> <Option2> ...\n"
-            "\n"
-            "Commands:\n"
-            "\n"
-            "  Help - Show this content.\n"
-            "\n"
-            "  Mount TCP [Host] [Port] [AccessName] [MountPoint]\n"
-            "    - Mount the specific 9p share over TCP.\n"
-            "  Mount HvSocket [Port] [AccessName] [MountPoint]\n"
-            "    - Mount the specific 9p share over Hyper-V Socket.\n"
-            "\n"
-            "Notes:\n"
-            "  - All command options are case-insensitive.\n"
-            "  - Mile.Cirno will run as the NanaBox EnableHostDriverStore\n"
-            "    integration mode if you don't specify another command, which\n"
-            "    is equivalent to the following command:\n"
-            "      Mile.Cirno Mount HvSocket 50001 HostDriverStore "
-            "%%SystemRoot%%\\System32\\HostDriverStore"
-            "\n"
-            "Examples:\n"
-            "\n"
-            "  Mile.Cirno Mount TCP 192.168.1.234 12345 MyShare C:\\MyMount\n"
-            "  Mile.Cirno Mount HvSocket 50001 HostDriverStore Z:\\\n"
-            "\n");
+        Log(EVENTLOG_INFORMATION_TYPE, DebugData,
+            L"Format: Mile.Cirno [Command] <Option1> <Option2> ...\n"
+            L"\n"
+            L"Commands:\n"
+            L"\n"
+            L"  Help - Show this content.\n"
+            L"\n"
+            L"  Mount TCP [Host] [Port] [AccessName] [MountPoint]\n"
+            L"    - Mount the specific 9p share over TCP.\n"
+            L"  Mount HvSocket [Port] [AccessName] [MountPoint]\n"
+            L"    - Mount the specific 9p share over Hyper-V Socket.\n"
+            L"\n"
+            L"Notes:\n"
+            L"  - All command options are case-insensitive.\n"
+            L"  - Mile.Cirno will run as the NanaBox EnableHostDriverStore\n"
+            L"    integration mode if you don't specify another command, which\n"
+            L"    is equivalent to the following command:\n"
+            L"      Mile.Cirno Mount HvSocket 50001 HostDriverStore "
+            L"%%SystemRoot%%\\System32\\HostDriverStore"
+            L"\n"
+            L"Examples:\n"
+            L"\n"
+            L"  Mile.Cirno Mount TCP 192.168.1.234 12345 MyShare C:\\MyMount\n"
+            L"  Mile.Cirno Mount HvSocket 50001 HostDriverStore Z:\\\n"
+            L"\n");
         return 0;
     }
 
@@ -614,9 +670,7 @@ int main()
         int WSAError = ::WSAStartup(MAKEWORD(2, 2), &WSAData);
         if (NO_ERROR != WSAError)
         {
-            std::wprintf(
-                L"[ERROR] WSAStartup failed (%d).\n",
-                WSAError);
+            Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"[ERROR] WSAStartup failed (%d).\n", WSAError);
             return -1;
         }
     }
@@ -649,9 +703,9 @@ int main()
                 Mile::Cirno::DefaultProtocolVersion;
             Mile::Cirno::VersionResponse Response =
                 g_Instance->Version(Request);
-            std::printf(
-                "[INFO] Response.ProtocolVersion = %s\n"
-                "[INFO] Response.MaximumMessageSize = %u\n",
+            Log(EVENTLOG_INFORMATION_TYPE, DebugData,
+                L"[INFO] Response.ProtocolVersion = %hs\n"
+                L"[INFO] Response.MaximumMessageSize = %u\n",
                 Response.ProtocolVersion.c_str(),
                 Response.MaximumMessageSize);
         }
@@ -665,14 +719,14 @@ int main()
             Request.NumericUserName = MILE_CIRNO_NONUNAME;
             Mile::Cirno::AttachResponse Response = g_Instance->Attach(Request);
             g_RootDirectoryFileId = Request.FileId;
-            std::printf(
-                "[INFO] Response.UniqueId.Path = 0x%016llX\n",
+            Log(EVENTLOG_INFORMATION_TYPE, DebugData,
+                L"[INFO] Response.UniqueId.Path = 0x%016llX\n",
                 Response.UniqueId.Path);
         }
     }
     catch (std::exception const& ex)
     {
-        std::printf("%s\n", ex.what());
+        Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"%hs\n", ex.what());
         return -1;
     }
 
