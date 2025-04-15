@@ -405,6 +405,42 @@ Mile::Cirno::LinuxOpenResponse Mile::Cirno::Client::LinuxOpen(
     return Mile::Cirno::PopLinuxOpenResponse(ResponseSpan);
 }
 
+Mile::Cirno::LinuxCreateResponse Mile::Cirno::Client::LinuxCreate(
+    Mile::Cirno::LinuxCreateRequest const& Request)
+{
+    std::vector<std::uint8_t> RequestBuffer;
+    Mile::Cirno::PushLinuxCreateRequest(
+        RequestBuffer,
+        Request);
+    std::vector<std::uint8_t> ResponseBuffer;
+    this->Request(
+        MileCirnoLinuxCreateRequestMessage,
+        RequestBuffer,
+        MileCirnoLinuxCreateResponseMessage,
+        ResponseBuffer);
+    std::span<std::uint8_t> ResponseSpan =
+        std::span<std::uint8_t>(ResponseBuffer);
+    return Mile::Cirno::PopLinuxCreateResponse(ResponseSpan);
+}
+
+Mile::Cirno::MkDirResponse Mile::Cirno::Client::MkDir(
+    Mile::Cirno::MkDirRequest const& Request)
+{
+    std::vector<std::uint8_t> RequestBuffer;
+    Mile::Cirno::PushMkDirRequest(
+        RequestBuffer,
+        Request);
+    std::vector<std::uint8_t> ResponseBuffer;
+    this->Request(
+        MileCirnoMkDirRequestMessage,
+        RequestBuffer,
+        MileCirnoMkDirResponseMessage,
+        ResponseBuffer);
+    std::span<std::uint8_t> ResponseSpan =
+        std::span<std::uint8_t>(ResponseBuffer);
+    return Mile::Cirno::PopMkDirResponse(ResponseSpan);
+}
+
 Mile::Cirno::ReadDirResponse Mile::Cirno::Client::ReadDir(
     Mile::Cirno::ReadDirRequest const& Request)
 {
@@ -441,6 +477,21 @@ Mile::Cirno::GetAttrResponse Mile::Cirno::Client::GetAttr(
     return Mile::Cirno::PopGetAttrResponse(ResponseSpan);
 }
 
+void Mile::Cirno::Client::SetAttr(
+    Mile::Cirno::SetAttrRequest const& Request)
+{
+    std::vector<std::uint8_t> RequestBuffer;
+    Mile::Cirno::PushSetAttrRequest(
+        RequestBuffer,
+        Request);
+    std::vector<std::uint8_t> ResponseBuffer;
+    this->Request(
+        MileCirnoSetAttrRequestMessage,
+        RequestBuffer,
+        MileCirnoSetAttrResponseMessage,
+        ResponseBuffer);
+}
+
 Mile::Cirno::StatFsResponse Mile::Cirno::Client::StatFs(
     Mile::Cirno::StatFsRequest const& Request)
 {
@@ -475,6 +526,54 @@ Mile::Cirno::ReadResponse Mile::Cirno::Client::Read(
     std::span<std::uint8_t> ResponseSpan =
         std::span<std::uint8_t>(ResponseBuffer);
     return Mile::Cirno::PopReadResponse(ResponseSpan);
+}
+
+Mile::Cirno::WriteResponse Mile::Cirno::Client::Write(
+    Mile::Cirno::WriteRequest const& Request)
+{
+    std::vector<std::uint8_t> RequestBuffer;
+    Mile::Cirno::PushWriteRequest(
+        RequestBuffer,
+        Request);
+    std::vector<std::uint8_t> ResponseBuffer;
+    this->Request(
+        MileCirnoWriteRequestMessage,
+        RequestBuffer,
+        MileCirnoWriteResponseMessage,
+        ResponseBuffer);
+    std::span<std::uint8_t> ResponseSpan =
+        std::span<std::uint8_t>(ResponseBuffer);
+    return Mile::Cirno::PopWriteResponse(ResponseSpan);
+}
+
+void Mile::Cirno::Client::RenameAt(
+    Mile::Cirno::RenameAtRequest const& Request)
+{
+    std::vector<std::uint8_t> RequestBuffer;
+    Mile::Cirno::PushRenameAtRequest(
+        RequestBuffer,
+        Request);
+    std::vector<std::uint8_t> ResponseBuffer;
+    this->Request(
+        MileCirnoRenameAtRequestMessage,
+        RequestBuffer,
+        MileCirnoRenameAtResponseMessage,
+        ResponseBuffer);
+}
+
+void Mile::Cirno::Client::Remove(
+    Mile::Cirno::RemoveRequest const& Request)
+{
+    std::vector<std::uint8_t> RequestBuffer;
+    Mile::Cirno::PushRemoveRequest(
+        RequestBuffer,
+        Request);
+    std::vector<std::uint8_t> ResponseBuffer;
+    this->Request(
+        MileCirnoRemoveRequestMessage,
+        RequestBuffer,
+        MileCirnoRemoveResponseMessage,
+        ResponseBuffer);
 }
 
 Mile::Cirno::Client* Mile::Cirno::Client::ConnectWithTcpSocket(
@@ -637,4 +736,18 @@ Mile::Cirno::Client* Mile::Cirno::Client::ConnectWithHyperVSocket(
     }
 
     return Object;
+}
+
+void Mile::Cirno::Client::FileTimeTo9pTimespec(const FILETIME* ft, uint64_t* sec_out, uint64_t* nsec_out)
+{
+    // Combine the 64-bit FILETIME value
+    uint64_t filetime = ((uint64_t)ft->dwHighDateTime << 32) | ft->dwLowDateTime;
+
+    // Convert to 100ns intervals since UNIX epoch (subtract difference)
+    const uint64_t EPOCH_DIFF = 116444736000000000ULL; // FILETIME to UNIX epoch offset
+    uint64_t unix_time_100ns = filetime - EPOCH_DIFF;
+
+    // Split into seconds and nanoseconds
+    *sec_out = unix_time_100ns / 10000000ULL;
+    *nsec_out = (unix_time_100ns % 10000000ULL) * 100;
 }

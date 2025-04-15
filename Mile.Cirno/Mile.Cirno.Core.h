@@ -79,11 +79,20 @@ namespace Mile::Cirno
         LinuxOpenResponse LinuxOpen(
             LinuxOpenRequest const& Request);
 
+        LinuxCreateResponse LinuxCreate(
+            LinuxCreateRequest const& Request);
+
+        MkDirResponse MkDir(
+            MkDirRequest const& Request);
+
         ReadDirResponse ReadDir(
             ReadDirRequest const& Request);
 
         GetAttrResponse GetAttr(
             GetAttrRequest const& Request);
+
+        void SetAttr(
+            SetAttrRequest const& Request);
 
         StatFsResponse StatFs(
             StatFsRequest const& Request);
@@ -91,12 +100,23 @@ namespace Mile::Cirno
         ReadResponse Read(
             ReadRequest const& Request);
 
+        WriteResponse Write(
+            WriteRequest const& Request);
+
+        void RenameAt(
+            RenameAtRequest const& Request);
+
+        void Remove(
+            RemoveRequest const& Request);
+
         static Client* ConnectWithTcpSocket(
             std::string const& Host,
             std::string const& Port);
 
         static Client* ConnectWithHyperVSocket(
             std::uint32_t const& Port);
+
+        static void FileTimeTo9pTimespec(const FILETIME* ft, uint64_t* sec_out, uint64_t* nsec_out);
     };
 }
 

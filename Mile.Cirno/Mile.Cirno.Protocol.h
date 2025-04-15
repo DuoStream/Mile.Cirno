@@ -893,6 +893,9 @@ namespace Mile
             std::vector<std::uint8_t> Data; // count, data
         };
 
+        const std::uint32_t WriteRequestHeaderSize =
+            HeaderSize + sizeof(std::uint32_t) + sizeof(std::uint64_t) + sizeof(std::uint32_t);
+
         struct WriteResponse
         {
             std::uint32_t Count;
