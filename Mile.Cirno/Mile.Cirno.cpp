@@ -1503,7 +1503,7 @@ void DOKAN_CALLBACK MileCirnoCleanup(
 
     Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called Cleanup(FileId = %u, FileName = %s)", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName);
 
-    if (result == STATUS_SUCCESS && DokanFileInfo->DeleteOnClose)
+    if (result == STATUS_SUCCESS && DokanFileInfo->DeletePending)
     {
         try
         {
