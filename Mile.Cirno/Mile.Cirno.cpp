@@ -2303,6 +2303,7 @@ int main()
         Mile::ToString(CP_UTF8, ::GetCommandLineW()));
 
     bool ParseSuccess = false;
+    bool Mount = false;
     std::string Host;
     std::string Port;
     std::string MountPoint;
@@ -2315,6 +2316,7 @@ int main()
             0 == ::_stricmp(Arguments[2].c_str(), "TCP"))
         {
             ParseSuccess = true;
+            Mount = true;
             Host = Arguments[3];
             Port = Arguments[4];
             g_AccessName = Arguments[5];
@@ -2326,6 +2328,7 @@ int main()
             0 == ::_stricmp(Arguments[2].c_str(), "HvSocket"))
         {
             ParseSuccess = true;
+            Mount = true;
             Host = "HvSocket";
             Port = Arguments[3];
             g_AccessName = Arguments[4];
@@ -2334,138 +2337,156 @@ int main()
             CaseSensitive = Arguments[7];
         }
     }
+    else if (0 == ::_stricmp(Arguments[1].c_str(), "Unmount"))
+    {
+        if (3 == Arguments.size())
+        {
+            ParseSuccess = true;
+            Mount = false;
+            MountPoint = Arguments[2];
+        }
+    }
 
     if (!ParseSuccess)
     {
         return 0;
     }
 
-    auto CleanupHandler = Mile::ScopeExitTaskHandler([&]()
+    if (Mount)
     {
-        if (g_Instance)
-        {
-            if (MILE_CIRNO_NOFID == g_RootDirectoryFileId)
+        auto CleanupHandler = Mile::ScopeExitTaskHandler([&]()
             {
-                g_Instance->FreeFileId(g_RootDirectoryFileId);
+                if (g_Instance)
+                {
+                    if (MILE_CIRNO_NOFID == g_RootDirectoryFileId)
+                    {
+                        g_Instance->FreeFileId(g_RootDirectoryFileId);
+                    }
+                    delete g_Instance;
+                    g_Instance = nullptr;
+                }
+
+                ::WSACleanup();
+
+                ::DokanShutdown();
+
+                ::DokanRemoveMountPoint(Mile::ToWideString(CP_UTF8, MountPoint).c_str());
+            });
+
+        ::DokanInit();
+
+        WSADATA WSAData = { 0 };
+        {
+            int WSAError = ::WSAStartup(MAKEWORD(2, 2), &WSAData);
+            if (NO_ERROR != WSAError)
+            {
+                Log(EVENTLOG_ERROR_TYPE, DebugData, L"WSAStartup failed (%d).", WSAError);
+                return -1;
             }
-            delete g_Instance;
-            g_Instance = nullptr;
         }
 
-        ::WSACleanup();
-
-        ::DokanShutdown();
-    });
-
-    ::DokanInit();
-
-    WSADATA WSAData = { 0 };
-    {
-        int WSAError = ::WSAStartup(MAKEWORD(2, 2), &WSAData);
-        if (NO_ERROR != WSAError)
+        try
         {
-            Log(EVENTLOG_ERROR_TYPE, DebugData, L"WSAStartup failed (%d).", WSAError);
+            {
+                if (0 == ::_stricmp(Host.c_str(), "HvSocket"))
+                {
+                    g_Instance = Mile::Cirno::Client::ConnectWithHyperVSocket(
+                        Mile::ToUInt32(Port));
+                }
+                else
+                {
+                    g_Instance = Mile::Cirno::Client::ConnectWithTcpSocket(Host, Port);
+                }
+            }
+            if (!g_Instance)
+            {
+                Mile::Cirno::ThrowException(
+                    "!Instance",
+                    ERROR_INVALID_DATA);
+            }
+
+            {
+                Mile::Cirno::VersionRequest Request;
+                Request.MaximumMessageSize =
+                    Mile::Cirno::DefaultMaximumMessageSize;
+                Request.ProtocolVersion =
+                    Mile::Cirno::DefaultProtocolVersion;
+                Mile::Cirno::VersionResponse Response =
+                    g_Instance->Version(Request);
+                Log(EVENTLOG_INFORMATION_TYPE, DebugData,
+                    L"Response.ProtocolVersion = %hs\n"
+                    L"Response.MaximumMessageSize = %u",
+                    Response.ProtocolVersion.c_str(),
+                    Response.MaximumMessageSize);
+            }
+
+            {
+                Mile::Cirno::AttachRequest Request;
+                Request.FileId = g_Instance->AllocateFileId();
+                Request.AuthenticationFileId = MILE_CIRNO_NOFID;
+                Request.UserName = "";
+                Request.AccessName = g_AccessName;
+                Request.NumericUserName = MILE_CIRNO_NONUNAME;
+                Mile::Cirno::AttachResponse Response = g_Instance->Attach(Request);
+                g_RootDirectoryFileId = Request.FileId;
+                Log(EVENTLOG_INFORMATION_TYPE, DebugData,
+                    L"Response.UniqueId.Path = 0x%016llX",
+                    Response.UniqueId.Path);
+            }
+        }
+        catch (std::exception const& ex)
+        {
+            Log(EVENTLOG_WARNING_TYPE, DebugData, L"AttachException: %hs", ex.what());
             return -1;
         }
-    }
 
-    try
+        std::wstring ConvertedMountPoint = Mile::ToWideString(CP_UTF8, MountPoint);
+
+        g_Options.Version = DOKAN_VERSION;
+        g_Options.SingleThread;
+        g_Options.Options =
+            (_stricmp(ReadOnly.c_str(), "true") == 0 ? DOKAN_OPTION_WRITE_PROTECT : 0) |
+            (_stricmp(CaseSensitive.c_str(), "true") == 0 ? DOKAN_OPTION_CASE_SENSITIVE : 0) |
+            DOKAN_OPTION_MOUNT_MANAGER;
+        g_Options.GlobalContext;
+        g_Options.MountPoint = ConvertedMountPoint.c_str();
+        g_Options.UNCName;
+        g_Options.Timeout = INFINITE;
+        g_Options.AllocationUnitSize;
+        g_Options.SectorSize;
+        g_Options.VolumeSecurityDescriptorLength; // I think we need to return a proper descriptor here for Steam to work without "Run as administrator"
+        g_Options.VolumeSecurityDescriptor;
+
+        DOKAN_OPERATIONS Operations = { 0 };
+        Operations.ZwCreateFile = ::MileCirnoZwCreateFile;
+        Operations.Cleanup = ::MileCirnoCleanup;
+        Operations.CloseFile = ::MileCirnoCloseFile;
+        Operations.ReadFile = ::MileCirnoReadFile;
+        Operations.WriteFile = ::MileCirnoWriteFile;
+        Operations.FlushFileBuffers = ::MileCirnoFlushFileBuffers;
+        Operations.GetFileInformation = ::MileCirnoGetFileInformation;
+        Operations.FindFiles = ::MileCirnoFindFiles;
+        Operations.FindFilesWithPattern = nullptr;
+        Operations.SetFileAttributesW = ::MileCirnoSetFileAttributesW;
+        Operations.SetFileTime = ::MileCirnoSetFileTime;
+        Operations.DeleteFileW = ::MileCirnoDeleteFileW;
+        Operations.DeleteDirectory = ::MileCirnoDeleteDirectory;
+        Operations.MoveFileW = ::MileCirnoMoveFileW;
+        Operations.SetEndOfFile = ::MileCirnoSetEndOfFile;
+        Operations.SetAllocationSize = ::MileCirnoSetAllocationSize;
+        Operations.LockFile = ::MileCirnoLockFile;
+        Operations.UnlockFile = ::MileCirnoUnlockFile;
+        Operations.GetDiskFreeSpaceW = ::MileCirnoGetDiskFreeSpace;
+        Operations.GetVolumeInformationW = ::MileCirnoGetVolumeInformationW;
+        Operations.Mounted;
+        Operations.Unmounted;
+        Operations.GetFileSecurityW = ::MileCirnoGetFileSecurityW;
+        Operations.SetFileSecurityW = ::MileCirnoSetFileSecurityW;
+        Operations.FindStreams;
+        return ::DokanMain(&g_Options, &Operations);
+    }
+    else
     {
-        {
-            if (0 == ::_stricmp(Host.c_str(), "HvSocket"))
-            {
-                g_Instance = Mile::Cirno::Client::ConnectWithHyperVSocket(
-                    Mile::ToUInt32(Port));
-            }
-            else
-            {
-                g_Instance = Mile::Cirno::Client::ConnectWithTcpSocket(Host, Port);
-            }
-        }
-        if (!g_Instance)
-        {
-            Mile::Cirno::ThrowException(
-                "!Instance",
-                ERROR_INVALID_DATA);
-        }
-
-        {
-            Mile::Cirno::VersionRequest Request;
-            Request.MaximumMessageSize =
-                Mile::Cirno::DefaultMaximumMessageSize;
-            Request.ProtocolVersion =
-                Mile::Cirno::DefaultProtocolVersion;
-            Mile::Cirno::VersionResponse Response =
-                g_Instance->Version(Request);
-            Log(EVENTLOG_INFORMATION_TYPE, DebugData,
-                L"Response.ProtocolVersion = %hs\n"
-                L"Response.MaximumMessageSize = %u",
-                Response.ProtocolVersion.c_str(),
-                Response.MaximumMessageSize);
-        }
-
-        {
-            Mile::Cirno::AttachRequest Request;
-            Request.FileId = g_Instance->AllocateFileId();
-            Request.AuthenticationFileId = MILE_CIRNO_NOFID;
-            Request.UserName = "";
-            Request.AccessName = g_AccessName;
-            Request.NumericUserName = MILE_CIRNO_NONUNAME;
-            Mile::Cirno::AttachResponse Response = g_Instance->Attach(Request);
-            g_RootDirectoryFileId = Request.FileId;
-            Log(EVENTLOG_INFORMATION_TYPE, DebugData,
-                L"Response.UniqueId.Path = 0x%016llX",
-                Response.UniqueId.Path);
-        }
+        ::DokanRemoveMountPoint(Mile::ToWideString(CP_UTF8, MountPoint).c_str());
     }
-    catch (std::exception const& ex)
-    {
-        Log(EVENTLOG_WARNING_TYPE, DebugData, L"AttachException: %hs", ex.what());
-        return -1;
-    }
-
-    std::wstring ConvertedMountPoint = Mile::ToWideString(CP_UTF8, MountPoint);
-
-    g_Options.Version = DOKAN_VERSION;
-    g_Options.SingleThread;
-    g_Options.Options =
-        (_stricmp(ReadOnly.c_str(), "true") == 0 ? DOKAN_OPTION_WRITE_PROTECT : 0) |
-        (_stricmp(CaseSensitive.c_str(), "true") == 0 ? DOKAN_OPTION_CASE_SENSITIVE : 0) |
-        DOKAN_OPTION_MOUNT_MANAGER;
-    g_Options.GlobalContext;
-    g_Options.MountPoint = ConvertedMountPoint.c_str();
-    g_Options.UNCName;
-    g_Options.Timeout = INFINITE;
-    g_Options.AllocationUnitSize;
-    g_Options.SectorSize;
-    g_Options.VolumeSecurityDescriptorLength; // I think we need to return a proper descriptor here for Steam to work without "Run as administrator"
-    g_Options.VolumeSecurityDescriptor;
-
-    DOKAN_OPERATIONS Operations = { 0 };
-    Operations.ZwCreateFile = ::MileCirnoZwCreateFile;
-    Operations.Cleanup = ::MileCirnoCleanup;
-    Operations.CloseFile = ::MileCirnoCloseFile;
-    Operations.ReadFile = ::MileCirnoReadFile;
-    Operations.WriteFile = ::MileCirnoWriteFile;
-    Operations.FlushFileBuffers = ::MileCirnoFlushFileBuffers;
-    Operations.GetFileInformation = ::MileCirnoGetFileInformation;
-    Operations.FindFiles = ::MileCirnoFindFiles;
-    Operations.FindFilesWithPattern = nullptr;
-    Operations.SetFileAttributesW = ::MileCirnoSetFileAttributesW;
-    Operations.SetFileTime = ::MileCirnoSetFileTime;
-    Operations.DeleteFileW = ::MileCirnoDeleteFileW;
-    Operations.DeleteDirectory = ::MileCirnoDeleteDirectory;
-    Operations.MoveFileW = ::MileCirnoMoveFileW;
-    Operations.SetEndOfFile = ::MileCirnoSetEndOfFile;
-    Operations.SetAllocationSize = ::MileCirnoSetAllocationSize;
-    Operations.LockFile = ::MileCirnoLockFile;
-    Operations.UnlockFile = ::MileCirnoUnlockFile;
-    Operations.GetDiskFreeSpaceW = ::MileCirnoGetDiskFreeSpace;
-    Operations.GetVolumeInformationW = ::MileCirnoGetVolumeInformationW;
-    Operations.Mounted;
-    Operations.Unmounted;
-    Operations.GetFileSecurityW = ::MileCirnoGetFileSecurityW;
-    Operations.SetFileSecurityW = ::MileCirnoSetFileSecurityW;
-    Operations.FindStreams;
-    return ::DokanMain(&g_Options, &Operations);
 }
