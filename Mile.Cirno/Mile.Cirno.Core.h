@@ -88,6 +88,9 @@ namespace Mile::Cirno
         ReadDirResponse ReadDir(
             ReadDirRequest const& Request);
 
+        WindowsReadDirResponse WindowsReadDir(
+            WindowsReadDirRequest const& Request);
+
         GetAttrResponse GetAttr(
             GetAttrRequest const& Request);
 

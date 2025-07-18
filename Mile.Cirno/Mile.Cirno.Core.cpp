@@ -459,6 +459,24 @@ Mile::Cirno::ReadDirResponse Mile::Cirno::Client::ReadDir(
     return Mile::Cirno::PopReadDirResponse(ResponseSpan);
 }
 
+Mile::Cirno::WindowsReadDirResponse Mile::Cirno::Client::WindowsReadDir(
+    Mile::Cirno::WindowsReadDirRequest const& Request)
+{
+    std::vector<std::uint8_t> RequestBuffer;
+    Mile::Cirno::PushWindowsReadDirRequest(
+        RequestBuffer,
+        Request);
+    std::vector<std::uint8_t> ResponseBuffer;
+    this->Request(
+        MileCirnoWindowsReadDirRequestMessage,
+        RequestBuffer,
+        MileCirnoWindowsReadDirResponseMessage,
+        ResponseBuffer);
+    std::span<std::uint8_t> ResponseSpan =
+        std::span<std::uint8_t>(ResponseBuffer);
+    return Mile::Cirno::PopWindowsReadDirResponse(ResponseSpan);
+}
+
 Mile::Cirno::GetAttrResponse Mile::Cirno::Client::GetAttr(
     Mile::Cirno::GetAttrRequest const& Request)
 {

@@ -498,6 +498,28 @@ Mile::Cirno::ReadDirResponse Mile::Cirno::PopReadDirResponse(
     return Result;
 }
 
+void Mile::Cirno::PushWindowsReadDirRequest(
+    std::vector<std::uint8_t>& Buffer,
+    Mile::Cirno::WindowsReadDirRequest const& Value)
+{
+    Mile::Cirno::PushUInt32(Buffer, Value.FileId);
+    Mile::Cirno::PushUInt64(Buffer, Value.Offset);
+    Mile::Cirno::PushUInt32(Buffer, Value.Count);
+}
+
+Mile::Cirno::WindowsReadDirResponse Mile::Cirno::PopWindowsReadDirResponse(
+    std::span<std::uint8_t>& Buffer)
+{
+    Mile::Cirno::WindowsReadDirResponse Result;
+    // Discard the unused Length field.
+    Mile::Cirno::PopUInt32(Buffer);
+    while (!Buffer.empty())
+    {
+        Result.Data.push_back(Mile::Cirno::PopWindowsDirectoryEntry(Buffer));
+    }
+    return Result;
+}
+
 void Mile::Cirno::PushFsyncRequest(
     std::vector<std::uint8_t>& Buffer,
     Mile::Cirno::FsyncRequest const& Value)

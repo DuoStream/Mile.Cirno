@@ -174,6 +174,13 @@ namespace Mile::Cirno
     ReadDirResponse PopReadDirResponse(
         std::span<std::uint8_t>& Buffer);
 
+    void PushWindowsReadDirRequest(
+        std::vector<std::uint8_t>& Buffer,
+        WindowsReadDirRequest const& Value);
+
+    WindowsReadDirResponse PopWindowsReadDirResponse(
+        std::span<std::uint8_t>& Buffer);
+
     void PushFsyncRequest(
         std::vector<std::uint8_t>& Buffer,
         FsyncRequest const& Value);
