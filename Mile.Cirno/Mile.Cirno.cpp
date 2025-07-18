@@ -30,8 +30,13 @@
 
 #include <filesystem>
 #include <span>
+#include <chrono>
 #include <vector>
+#include <algorithm>
 #include <string>
+
+#include <atomic>
+#include <mutex>
 
 #include "Mile.Cirno.Core.h"
 #include "Mile.Cirno.Protocol.Parser.h"
@@ -55,7 +60,7 @@ typedef enum
 /// <summary>
 /// The current log level.
 /// </summary>
-static LogComponents EnabledLogLevels = (LogComponents)(Nothing);
+static LogComponents EnabledLogLevels = (LogComponents)(LightTraces);
 
 /// <summary>
 /// Logs a message to the Windows event log.
@@ -87,7 +92,7 @@ static BOOL Log(WORD type, LogComponents logLevel, const wchar_t* format, ...)
             va_end(args);
 
             // Allocate a buffer for the formatted message
-            wchar_t* logMessage = (wchar_t*)_alloca(length * sizeof(wchar_t));
+            wchar_t* logMessage = (wchar_t*)_malloca(length * sizeof(wchar_t));
 
             // Format the log message.
             va_start(args, format);
@@ -102,6 +107,124 @@ static BOOL Log(WORD type, LogComponents logLevel, const wchar_t* format, ...)
 
     // Return the result
     return result;
+}
+
+/// <summary>
+/// The mount point for the file system.
+/// </summary>
+std::string g_MountPoint;
+
+/// <summary>
+/// The access name for the file system.
+/// </summary>
+std::string g_AccessName;
+
+/// <summary>
+/// The options for the file system.
+/// </summary>
+DOKAN_OPTIONS g_Options = { 0 };
+
+/// <summary>
+/// The instance of the Cirno client.
+/// </summary>
+Mile::Cirno::Client* g_Instance = nullptr;
+
+/// <summary>
+/// The root directory file ID.
+/// </summary>
+std::uint32_t g_RootDirectoryFileId = MILE_CIRNO_NOFID;
+
+/// <summary>
+/// Represents the benchmark data for an operation.
+/// </summary>
+struct BenchmarkData
+{
+    /// <summary>
+    /// The operation name.
+    /// </summary>
+    std::string operation;
+
+    /// <summary>
+    /// The durations of each run.
+    /// </summary>
+    std::vector<std::chrono::microseconds> durations;
+};
+
+/// <summary>
+/// Global mutex to protect the benchmark data.
+/// </summary>
+std::mutex g_BenchmarkMutex;
+
+/// <summary>
+/// Global benchmark map to store the benchmark data for each operation.
+/// </summary>
+std::map<std::string, BenchmarkData> g_BenchmarkMap;
+
+/// <summary>
+/// The last time a benchmark was logged.
+/// </summary>
+std::atomic<std::chrono::steady_clock::time_point> g_LastLogTime = std::chrono::steady_clock::now();
+
+/// <summary>
+/// Logs the benchmark data collected so far.
+/// </summary>
+void LogBenchmarkData()
+{
+    // Get the current time
+    auto now = std::chrono::steady_clock::now();
+
+    // At least one minute has passed since the last log
+    if (now - g_LastLogTime.load() >= std::chrono::minutes(1))
+    {
+        // Prevent logging too frequently
+        g_LastLogTime = now;
+
+        // Produce a formatted string with the benchmark data
+        std::string benchmark_data;
+        for (auto& [op, data] : g_BenchmarkMap)
+        {
+            if (!data.durations.empty())
+            {
+                auto median = data.durations.size() % 2 == 0
+                    ? (data.durations[data.durations.size() / 2 - 1] + data.durations[data.durations.size() / 2]) / 2
+                    : data.durations[data.durations.size() / 2];
+
+                benchmark_data += op + ": Median time = " + std::to_string(median.count()) + " microseconds\n";
+            }
+        }
+
+        // There's at least one operation with recorded data
+        if (!benchmark_data.empty())
+        {
+            // Log the benchmark data
+            Log(EVENTLOG_INFORMATION_TYPE, DebugData, L"%hs Benchmark:\n%hs", g_MountPoint.c_str(), benchmark_data.c_str());
+
+            // Clear the data after logging
+            g_BenchmarkMap.clear();
+        }
+    }
+}
+
+/// <summary>
+/// Records the benchmark data for a given operation.
+/// </summary>
+/// <param name="operation">The operation name.</param>
+/// <param name="duration">The duration of the operation in microseconds.</param>
+inline void RecordBenchmarkData(std::string const& operation, std::chrono::steady_clock::duration duration)
+{
+    // We want to log benchmark data
+    if (EnabledLogLevels & DebugData)
+    {
+        // Lock the mutex to ensure thread-safe access
+        std::lock_guard<std::mutex> lock(g_BenchmarkMutex);
+
+        // Add the duration to the benchmark map
+        g_BenchmarkMap[operation].operation = operation;
+        g_BenchmarkMap[operation].durations.push_back(std::chrono::duration_cast<std::chrono::microseconds>(duration));
+
+        // Log the benchmark data
+        LogBenchmarkData();
+    }
 }
 
 /// <summary>
@@ -1174,26 +1297,21 @@ std::wstring GetSecurityInformationString(_In_ SECURITY_INFORMATION securityInfo
 // There are 11644473600 seconds between these two epochs.
 const std::uint64_t SecondsBetweenWin32TimeAndUnixTime = 11644473600ULL;
 
-FILETIME ToFileTime(
+inline FILETIME ToFileTime(
     std::uint64_t UnixTimeSeconds,
     std::uint64_t UnixTimeNanoseconds)
 {
-    std::uint64_t RawResult = UnixTimeSeconds;
-    RawResult += SecondsBetweenWin32TimeAndUnixTime;
-    RawResult *= 1000 * 1000 * 10;
-    RawResult += UnixTimeNanoseconds / 100;
-    FILETIME Result;
-    Result.dwLowDateTime = static_cast<DWORD>(RawResult);
-    Result.dwHighDateTime = static_cast<DWORD>(RawResult >> 32);
-    return Result;
-}
+    constexpr std::uint64_t HUNDRED_NS_PER_SEC = 10'000'000ULL;
+    constexpr std::uint64_t UNIX_TO_WIN_EPOCH_SECS = 11644473600ULL;
 
-namespace
-{
-    std::string g_AccessName;
-    DOKAN_OPTIONS g_Options = { 0 };
-    Mile::Cirno::Client* g_Instance = nullptr;
-    std::uint32_t g_RootDirectoryFileId = MILE_CIRNO_NOFID;
+    std::uint64_t total100ns =
+        (UnixTimeSeconds + UNIX_TO_WIN_EPOCH_SECS) * HUNDRED_NS_PER_SEC +
+        (UnixTimeNanoseconds / 100);
+
+    FILETIME ft;
+    ft.dwLowDateTime = static_cast<DWORD>(total100ns);
+    ft.dwHighDateTime = static_cast<DWORD>(total100ns >> 32);
+    return ft;
 }
 
 NTSTATUS DOKAN_CALLBACK MileCirnoZwCreateFile(
@@ -1210,6 +1328,9 @@ NTSTATUS DOKAN_CALLBACK MileCirnoZwCreateFile(
     UNREFERENCED_PARAMETER(SecurityContext);
     UNREFERENCED_PARAMETER(FileAttributes);
     UNREFERENCED_PARAMETER(ShareAccess);
+
+    // Start measuring time
+    auto start_time = std::chrono::steady_clock::now();
 
     // The result
     NTSTATUS result = STATUS_OBJECT_NAME_NOT_FOUND;
@@ -1324,7 +1445,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoZwCreateFile(
             // Let the caller know that we opened an existing file
             result = STATUS_SUCCESS;
         }
-        catch (std::exception const& ex)
+        catch (...)
         {
             // We have a file ID that needs to get clunked
             if (MILE_CIRNO_NOFID != WalkRequest.NewFileId)
@@ -1336,11 +1457,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoZwCreateFile(
                     ClunkRequest.FileId = WalkRequest.NewFileId;
                     g_Instance->Clunk(ClunkRequest);
                 }
-                catch (std::exception const& ex)
-                {
-                    // Log the exception
-                    Log(EVENTLOG_WARNING_TYPE, DebugData, L"ClunkException: %hs", ex.what());
-                }
+                catch (...) { }
 
                 // Free the file ID
                 g_Instance->FreeFileId(WalkRequest.NewFileId);
@@ -1410,7 +1527,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoZwCreateFile(
                     // Let the caller know that we created a new file
                     result = STATUS_SUCCESS;
                 }
-                catch (std::exception const& ex)
+                catch (...)
                 {
                     // We have a file ID that needs to get clunked
                     if (MILE_CIRNO_NOFID != WalkRequest.NewFileId)
@@ -1422,27 +1539,17 @@ NTSTATUS DOKAN_CALLBACK MileCirnoZwCreateFile(
                             ClunkRequest.FileId = WalkRequest.NewFileId;
                             g_Instance->Clunk(ClunkRequest);
                         }
-                        catch (std::exception const& ex)
-                        {
-                            // Log the exception
-                            Log(EVENTLOG_WARNING_TYPE, DebugData, L"ClunkException: %hs", ex.what());
-                        }
+                        catch (...) { }
 
                         // Free the file ID
                         g_Instance->FreeFileId(WalkRequest.NewFileId);
                     }
-
-                    // Log the exception
-                    Log(EVENTLOG_WARNING_TYPE, DebugData, L"CreateException: %hs", ex.what());
                 }
             }
 
             // The file doesn't exist and we don't want to create it
             else
             {
-                // Log the exception
-                Log(EVENTLOG_WARNING_TYPE, DebugData, L"OpenException: %hs", ex.what());
-
                 // Build a walk request to the requested file's parent directory
                 WalkRequest.FileId = g_RootDirectoryFileId;
                 WalkRequest.NewFileId = g_Instance->AllocateFileId();
@@ -1466,10 +1573,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoZwCreateFile(
                                     ClunkRequest.FileId = WalkRequest.NewFileId;
                                     g_Instance->Clunk(ClunkRequest);
                                 }
-                                catch (std::exception const& ex)
-                                {
-                                    Log(EVENTLOG_WARNING_TYPE, DebugData, L"ClunkException: %hs", ex.what());
-                                }
+                                catch (...) { }
                                 g_Instance->FreeFileId(WalkRequest.NewFileId);
                             }
                         });
@@ -1486,8 +1590,8 @@ NTSTATUS DOKAN_CALLBACK MileCirnoZwCreateFile(
         }
     }
 
-    // Log the request
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called ZwCreateFile(FileName = %s, DesiredAccess = %s, FileAttributes = %s, CreateDisposition = %s, CreateOptions = %s) with a result of 0x%08X (FileId: %u)", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileName, GetDesiredAccessString(DesiredAccess).c_str(), GetFileAttributesString(FileAttributes).c_str(), GetCreateDispositionString(CreateDisposition).c_str(), GetCreateOptionsString(CreateOptions).c_str(), result, (uint32_t)DokanFileInfo->Context);
+    // Record the benchmark data
+    RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
 
     // Return the result
     return result;
@@ -1497,11 +1601,13 @@ void DOKAN_CALLBACK MileCirnoCleanup(
     _In_ LPCWSTR FileName,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
+    UNREFERENCED_PARAMETER(FileName);
+
+    auto start_time = std::chrono::steady_clock::now();
+
     std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
 
     NTSTATUS result = MILE_CIRNO_NOFID != FileId ? STATUS_SUCCESS : STATUS_NOT_FOUND;
-
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called Cleanup(FileId = %u, FileName = %s)", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName);
 
     if (result == STATUS_SUCCESS && DokanFileInfo->DeletePending)
     {
@@ -1511,22 +1617,23 @@ void DOKAN_CALLBACK MileCirnoCleanup(
             Request.FileId = FileId;
             g_Instance->Remove(Request);
         }
-        catch (std::exception const& ex)
-        {
-            Log(EVENTLOG_WARNING_TYPE, DebugData, L"RemoveException: %hs", ex.what());
-        }
+        catch (...) { }
     }
+
+    RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
 }
 
 void DOKAN_CALLBACK MileCirnoCloseFile(
     _In_ LPCWSTR FileName,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
+    UNREFERENCED_PARAMETER(FileName);
+
+    auto start_time = std::chrono::steady_clock::now();
+
     std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
 
     NTSTATUS result = MILE_CIRNO_NOFID != FileId ? STATUS_SUCCESS : STATUS_NOT_FOUND;
-
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called CloseFile(FileId = %u, FileName = %s)", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName);
 
     if (result == STATUS_SUCCESS)
     {
@@ -1536,13 +1643,12 @@ void DOKAN_CALLBACK MileCirnoCloseFile(
             Request.FileId = FileId;
             g_Instance->Clunk(Request);
         }
-        catch (std::exception const& ex)
-        {
-            Log(EVENTLOG_WARNING_TYPE, DebugData, L"ClunkException: %hs", ex.what());
-        }
+        catch (...) { }
 
         g_Instance->FreeFileId(FileId);
     }
+
+    RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
 }
 
 NTSTATUS DOKAN_CALLBACK MileCirnoReadFile(
@@ -1553,6 +1659,10 @@ NTSTATUS DOKAN_CALLBACK MileCirnoReadFile(
     _In_ LONGLONG Offset,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
+    UNREFERENCED_PARAMETER(FileName);
+
+    auto start_time = std::chrono::steady_clock::now();
+
     NTSTATUS result = STATUS_NOT_IMPLEMENTED;
 
     std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
@@ -1600,10 +1710,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoReadFile(
 
             result = STATUS_SUCCESS;
         }
-        catch (std::exception const& ex)
-        {
-            Log(EVENTLOG_WARNING_TYPE, DebugData, L"ReadException: %hs", ex.what());
-        }
+        catch (...) { }
 
         if (ReadLength)
         {
@@ -1611,7 +1718,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoReadFile(
         }
     }
 
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called ReadFile(FileId = %u, FileName = %s, Offset = %llu, Length = %u) with a result of 0x%08X (ReadLength = %u)", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, Offset, BufferLength, result, ReadLength != NULL ? *ReadLength : 0);
+    RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
 
     return result;
 }
@@ -1624,6 +1731,10 @@ NTSTATUS DOKAN_CALLBACK MileCirnoWriteFile(
     _In_ LONGLONG Offset,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
+    UNREFERENCED_PARAMETER(FileName);
+
+    auto start_time = std::chrono::steady_clock::now();
+
     NTSTATUS result = STATUS_NOT_IMPLEMENTED;
 
     std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
@@ -1634,18 +1745,13 @@ NTSTATUS DOKAN_CALLBACK MileCirnoWriteFile(
         {
             try
             {
-                // Set the offset to the end of the file
                 Mile::Cirno::GetAttrRequest Request;
                 Request.FileId = FileId;
                 Request.RequestMask = MileCirnoLinuxGetAttrFlagSize;
                 Mile::Cirno::GetAttrResponse Response = g_Instance->GetAttr(Request);
                 Offset = Response.FileSize;
             }
-            catch (std::exception const& ex)
-            {
-                // Log the exception
-                Log(EVENTLOG_WARNING_TYPE, DebugData, L"GetAttrException: %hs", ex.what());
-            }
+            catch (...) { }
         }
 
         DWORD MaximumChunkSize = Mile::Cirno::DefaultMaximumMessageSize - Mile::Cirno::WriteRequestHeaderSize;
@@ -1681,10 +1787,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoWriteFile(
 
             result = STATUS_SUCCESS;
         }
-        catch (std::exception const& ex)
-        {
-            Log(EVENTLOG_WARNING_TYPE, DebugData, L"WriteException: %hs", ex.what());
-        }
+        catch (...) { }
 
         if (NumberOfBytesWritten)
         {
@@ -1692,7 +1795,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoWriteFile(
         }
     }
 
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called WriteFile(FileId = %u, FileName = %s, Offset = %lld, NumberOfBytesToWrite = %u) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, Offset, NumberOfBytesToWrite, result);
+    RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
 
     return result;
 }
@@ -1701,13 +1804,10 @@ NTSTATUS DOKAN_CALLBACK MileCirnoFlushFileBuffers(
     _In_ LPCWSTR FileName,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
-    NTSTATUS result = STATUS_SUCCESS;
+    UNREFERENCED_PARAMETER(FileName);
+    UNREFERENCED_PARAMETER(DokanFileInfo);
 
-    std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
-
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called FlushFileBuffers(FileId = %u, FileName = %s) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, result);
-
-    return result;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS DOKAN_CALLBACK MileCirnoGetFileInformation(
@@ -1715,6 +1815,10 @@ NTSTATUS DOKAN_CALLBACK MileCirnoGetFileInformation(
     _Out_ LPBY_HANDLE_FILE_INFORMATION Buffer,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
+    UNREFERENCED_PARAMETER(FileName);
+
+    auto start_time = std::chrono::steady_clock::now();
+
     NTSTATUS result = STATUS_NOT_IMPLEMENTED;
 
     std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
@@ -1729,7 +1833,6 @@ NTSTATUS DOKAN_CALLBACK MileCirnoGetFileInformation(
             Request.FileId = FileId;
             Request.RequestMask =
                 MileCirnoLinuxGetAttrFlagMode |
-                MileCirnoLinuxGetAttrFlagNumberOfHardLinks |
                 MileCirnoLinuxGetAttrFlagLastAccessTime |
                 MileCirnoLinuxGetAttrFlagLastWriteTime |
                 MileCirnoLinuxGetAttrFlagSize;
@@ -1767,13 +1870,10 @@ NTSTATUS DOKAN_CALLBACK MileCirnoGetFileInformation(
 
             result = STATUS_SUCCESS;
         }
-        catch (std::exception const& ex)
-        {
-            Log(EVENTLOG_WARNING_TYPE, DebugData, L"GetAttrException: %hs", ex.what());
-        }
+        catch (...) { }
     }
 
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called GetFileInformation(FileId = %u, FileName = %s) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, result);
+    RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
 
     return result;
 }
@@ -1783,115 +1883,110 @@ NTSTATUS DOKAN_CALLBACK MileCirnoFindFiles(
     _In_ PFillFindData FillFindData,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
+    UNREFERENCED_PARAMETER(FileName);
+
+    auto start_time = std::chrono::steady_clock::now();
     NTSTATUS result = STATUS_NOT_IMPLEMENTED;
 
     std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
+    if (FileId == MILE_CIRNO_NOFID || !DokanFileInfo->IsDirectory) {
+        RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
+        return result;
+    }
 
-    if (MILE_CIRNO_NOFID != FileId && DokanFileInfo->IsDirectory)
-    {
-        try
-        {
-            std::uint64_t LastOffset = 0;
-            do
-            {
-                Mile::Cirno::ReadDirRequest Request;
-                Request.FileId = FileId;
-                Request.Offset = LastOffset;
-                LastOffset = 0;
-                Request.Count = Mile::Cirno::DefaultMaximumMessageSize;
-                Request.Count -= Mile::Cirno::ReadDirResponseHeaderSize;
-                Mile::Cirno::ReadDirResponse Response =
-                    g_Instance->ReadDir(Request);
-                for (Mile::Cirno::DirectoryEntry const& Entry : Response.Data)
-                {
-                    LastOffset = Entry.Offset;
+    try {
+        std::uint64_t LastOffset = 0;
+        std::wstring WideNameBuffer;
 
-                    if ("." == Entry.Name || ".." == Entry.Name)
-                    {
-                        continue;
-                    }
+        FILETIME currentTime;
+        ::GetSystemTimeAsFileTime(&currentTime);
 
-                    WIN32_FIND_DATAW FindData = { 0 };
-                    FindData.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-                    ::wcscpy_s(
-                        FindData.cFileName,
-                        Mile::ToWideString(CP_UTF8, Entry.Name).c_str());
+        do {
+            Mile::Cirno::ReadDirRequest Request;
+            Request.FileId = FileId;
+            Request.Offset = LastOffset;
+            LastOffset = 0;
+            Request.Count = Mile::Cirno::DefaultMaximumMessageSize - Mile::Cirno::ReadDirResponseHeaderSize;
 
-                    try
-                    {
+            Mile::Cirno::ReadDirResponse Response = g_Instance->ReadDir(Request);
+
+            for (const auto& Entry : Response.Data) {
+                LastOffset = Entry.Offset;
+
+                if (Entry.Name == "." || Entry.Name == "..")
+                    continue;
+
+                WIN32_FIND_DATAW FindData{};
+                FindData.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+
+                WideNameBuffer = Mile::ToWideString(CP_UTF8, Entry.Name);
+                wcsncpy_s(FindData.cFileName, WideNameBuffer.c_str(), _TRUNCATE);
+
+                bool isDirectory = (Entry.UniqueId.Type & 0x80) != 0;
+
+                if (isDirectory) {
+                    FindData.dwFileAttributes |= FILE_ATTRIBUTE_DIRECTORY;
+
+                    FindData.ftCreationTime = currentTime;
+                    FindData.ftLastAccessTime = currentTime;
+                    FindData.ftLastWriteTime = currentTime;
+
+                    FindData.nFileSizeHigh = 0;
+                    FindData.nFileSizeLow = 0;
+                }
+                else {
+                    try {
                         Mile::Cirno::WalkRequest WalkRequest;
                         WalkRequest.FileId = FileId;
                         WalkRequest.NewFileId = g_Instance->AllocateFileId();
-                        WalkRequest.Names.push_back(Entry.Name);
-
-                        auto CurrentCleanupHandler = Mile::ScopeExitTaskHandler([&]()
-                            {
-                                if (MILE_CIRNO_NOFID != WalkRequest.NewFileId)
-                                {
-                                    try
-                                    {
-                                        Mile::Cirno::ClunkRequest ClunkRequest;
-                                        ClunkRequest.FileId = WalkRequest.NewFileId;
-                                        g_Instance->Clunk(ClunkRequest);
-                                    }
-                                    catch (std::exception const& ex)
-                                    {
-                                        Log(EVENTLOG_WARNING_TYPE, DebugData, L"ClunkException: %hs", ex.what());
-                                    }
-                                    g_Instance->FreeFileId(WalkRequest.NewFileId);
-                                }
-                            });
+                        WalkRequest.Names.emplace_back(Entry.Name);
 
                         g_Instance->Walk(WalkRequest);
 
-                        Mile::Cirno::GetAttrRequest InformationRequest;
-                        InformationRequest.FileId = WalkRequest.NewFileId;
-                        InformationRequest.RequestMask =
-                            MileCirnoLinuxGetAttrFlagMode |
-                            MileCirnoLinuxGetAttrFlagNumberOfHardLinks |
-                            MileCirnoLinuxGetAttrFlagLastAccessTime |
-                            MileCirnoLinuxGetAttrFlagLastWriteTime |
+                        auto CleanupHandler = Mile::ScopeExitTaskHandler([&]() {
+                            if (WalkRequest.NewFileId != MILE_CIRNO_NOFID) {
+                                try {
+                                    Mile::Cirno::ClunkRequest ClunkReq{ WalkRequest.NewFileId };
+                                    g_Instance->Clunk(ClunkReq);
+                                }
+                                catch (...) {}
+                                g_Instance->FreeFileId(WalkRequest.NewFileId);
+                            }
+                            });
+
+                        Mile::Cirno::GetAttrRequest InfoReq;
+                        InfoReq.FileId = WalkRequest.NewFileId;
+                        InfoReq.RequestMask =
                             MileCirnoLinuxGetAttrFlagSize;
-                        Mile::Cirno::GetAttrResponse InformationResponse =
-                            g_Instance->GetAttr(InformationRequest);
 
-                        if (S_IFDIR & InformationResponse.Mode)
-                        {
-                            FindData.dwFileAttributes |= FILE_ATTRIBUTE_DIRECTORY;
-                        }
+                        auto InfoResp = g_Instance->GetAttr(InfoReq);
 
-                        FindData.ftCreationTime;
+                        FindData.ftCreationTime = currentTime;
+                        FindData.ftLastAccessTime = currentTime;
+                        FindData.ftLastWriteTime = currentTime;
 
-                        FindData.ftLastAccessTime = ::ToFileTime(
-                            InformationResponse.LastAccessTimeSeconds,
-                            InformationResponse.LastAccessTimeNanoseconds);
-                        FindData.ftLastWriteTime = ::ToFileTime(
-                            InformationResponse.LastWriteTimeSeconds,
-                            InformationResponse.LastWriteTimeNanoseconds);
-                        FindData.nFileSizeHigh =
-                            static_cast<DWORD>(InformationResponse.FileSize >> 32);
-                        FindData.nFileSizeLow =
-                            static_cast<DWORD>(InformationResponse.FileSize);
+                        FindData.nFileSizeHigh = static_cast<DWORD>(InfoResp.FileSize >> 32);
+                        FindData.nFileSizeLow = static_cast<DWORD>(InfoResp.FileSize);
                     }
-                    catch (std::exception const& ex)
-                    {
-                        Log(EVENTLOG_WARNING_TYPE, DebugData, L"GetAttrException: %hs", ex.what());
-                    }
+                    catch (...) {
+                        FindData.ftCreationTime = currentTime;
+                        FindData.ftLastAccessTime = currentTime;
+                        FindData.ftLastWriteTime = currentTime;
 
-                    FillFindData(&FindData, DokanFileInfo);
+                        FindData.nFileSizeHigh = 0;
+                        FindData.nFileSizeLow = 0;
+                    }
                 }
-            } while (LastOffset);
 
-            result = STATUS_SUCCESS;
-        }
-        catch (std::exception const& ex)
-        {
-            Log(EVENTLOG_WARNING_TYPE, DebugData, L"ReadDirException: %hs", ex.what());
-        }
+                FillFindData(&FindData, DokanFileInfo);
+            }
+        } while (LastOffset);
+
+        result = STATUS_SUCCESS;
     }
+    catch (...) { }
 
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called FindFiles(FileId = %u, FileName = %s) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, result);
-
+    RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
     return result;
 }
 
@@ -1900,13 +1995,11 @@ NTSTATUS DOKAN_CALLBACK MileCirnoSetFileAttributesW(
     _In_ DWORD FileAttributes,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
-    NTSTATUS result = STATUS_SUCCESS;
+    UNREFERENCED_PARAMETER(FileName);
+    UNREFERENCED_PARAMETER(FileAttributes);
+    UNREFERENCED_PARAMETER(DokanFileInfo);
 
-    std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
-
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called SetFileAttributesW(FileId = %u, FileName = %s, FileAttributes = 0x%08X) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, FileAttributes, result);
-
-    return result;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS DOKAN_CALLBACK MileCirnoSetFileTime(
@@ -1916,57 +2009,33 @@ NTSTATUS DOKAN_CALLBACK MileCirnoSetFileTime(
     _In_ CONST FILETIME* LastWriteTime,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
-    NTSTATUS result = STATUS_NOT_IMPLEMENTED;
+    UNREFERENCED_PARAMETER(FileName);
+    UNREFERENCED_PARAMETER(CreationTime);
+    UNREFERENCED_PARAMETER(LastAccessTime);
+    UNREFERENCED_PARAMETER(LastWriteTime);
+    UNREFERENCED_PARAMETER(DokanFileInfo);
 
-    std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
-
-    if (MILE_CIRNO_NOFID != FileId)
-    {
-        try
-        {
-            Mile::Cirno::SetAttrRequest Request = { 0 };
-            Request.FileId = FileId;
-            Request.Valid = (CreationTime != NULL ? MileCirnoLinuxSetAttrFlagChangeTime : 0) | (LastAccessTime != NULL ? MileCirnoLinuxSetAttrFlagLastAccessTime : 0) | (LastWriteTime != NULL ? MileCirnoLinuxSetAttrFlagLastWriteTime : 0);
-            if (LastAccessTime != NULL)
-            {
-                Mile::Cirno::Client::FileTimeTo9pTimespec(LastAccessTime, &Request.LastAccessTimeSeconds, &Request.LastAccessTimeNanoseconds);
-            }
-            if (LastWriteTime != NULL)
-            {
-                Mile::Cirno::Client::FileTimeTo9pTimespec(LastWriteTime, &Request.LastWriteTimeSeconds, &Request.LastWriteTimeNanoseconds);
-            }
-            g_Instance->SetAttr(Request);
-
-            result = STATUS_SUCCESS;
-        }
-        catch (std::exception const& ex)
-        {
-            Log(EVENTLOG_WARNING_TYPE, DebugData, L"SetAttrException: %hs", ex.what());
-        }
-    }
-
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called SetFileTime(FileId = %u, FileName = %s) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, result);
-
-    return result;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS DOKAN_CALLBACK MileCirnoDeleteFileW(
     _In_ LPCWSTR FileName,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
-    NTSTATUS result = STATUS_SUCCESS;
+    UNREFERENCED_PARAMETER(FileName);
+    UNREFERENCED_PARAMETER(DokanFileInfo);
 
-    std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
-
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called DeleteFileW(FileId = %u, FileName = %s) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, result);
-
-    return result;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS DOKAN_CALLBACK MileCirnoDeleteDirectory(
     _In_ LPCWSTR FileName,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
+    UNREFERENCED_PARAMETER(FileName);
+
+    auto start_time = std::chrono::steady_clock::now();
+
     NTSTATUS result = STATUS_ACCESS_DENIED;
 
     std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
@@ -1991,13 +2060,10 @@ NTSTATUS DOKAN_CALLBACK MileCirnoDeleteDirectory(
                 result = STATUS_SUCCESS;
             }
         }
-        catch (std::exception const& ex)
-        {
-            Log(EVENTLOG_WARNING_TYPE, DebugData, L"ReadDirException: %hs", ex.what());
-        }
+        catch (...) { }
     }
 
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called DeleteDirectory(FileId = %u, FileName = %s) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, result);
+    RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
 
     return result;
 }
@@ -2008,6 +2074,10 @@ NTSTATUS DOKAN_CALLBACK MileCirnoMoveFileW(
     _In_ BOOL ReplaceIfExisting,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
+    UNREFERENCED_PARAMETER(ReplaceIfExisting);
+
+    auto start_time = std::chrono::steady_clock::now();
+
     NTSTATUS result = STATUS_NOT_IMPLEMENTED;
 
     std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
@@ -2041,10 +2111,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoMoveFileW(
                             ClunkRequest.FileId = OldDirectoryWalkRequest.NewFileId;
                             g_Instance->Clunk(ClunkRequest);
                         }
-                        catch (std::exception const& ex)
-                        {
-                            Log(EVENTLOG_WARNING_TYPE, DebugData, L"ClunkException: %hs", ex.what());
-                        }
+                        catch (...) { }
                         g_Instance->FreeFileId(OldDirectoryWalkRequest.NewFileId);
                     }
                 });
@@ -2073,10 +2140,7 @@ NTSTATUS DOKAN_CALLBACK MileCirnoMoveFileW(
                             ClunkRequest.FileId = NewDirectoryWalkRequest.NewFileId;
                             g_Instance->Clunk(ClunkRequest);
                         }
-                        catch (std::exception const& ex)
-                        {
-                            Log(EVENTLOG_WARNING_TYPE, DebugData, L"ClunkException: %hs", ex.what());
-                        }
+                        catch (...) { }
                         g_Instance->FreeFileId(NewDirectoryWalkRequest.NewFileId);
                     }
                 });
@@ -2092,13 +2156,10 @@ NTSTATUS DOKAN_CALLBACK MileCirnoMoveFileW(
 
             result = STATUS_SUCCESS;
         }
-        catch (std::exception const& ex)
-        {
-            Log(EVENTLOG_WARNING_TYPE, DebugData, L"RenameException: %hs", ex.what());
-        }
+        catch (...) { }
     }
 
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called MoveFileW(FileId = %u, FileName = %s, NewFileName = %s, ReplaceIfExisting = %s) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, NewFileName, ReplaceIfExisting ? L"true" : L"false", result);
+    RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
 
     return result;
 }
@@ -2108,6 +2169,10 @@ NTSTATUS DOKAN_CALLBACK MileCirnoSetEndOfFile(
     _In_ LONGLONG ByteOffset,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
+    UNREFERENCED_PARAMETER(FileName);
+
+    auto start_time = std::chrono::steady_clock::now();
+
     NTSTATUS result = STATUS_NOT_IMPLEMENTED;
 
     std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
@@ -2124,13 +2189,10 @@ NTSTATUS DOKAN_CALLBACK MileCirnoSetEndOfFile(
 
             result = STATUS_SUCCESS;
         }
-        catch (std::exception const& ex)
-        {
-            Log(EVENTLOG_WARNING_TYPE, DebugData, L"SetAttrException: %hs", ex.what());
-        }
+        catch (...) { }
     }
 
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called SetEndOfFile(FileId = %u, FileName = %s, ByteOffset = %lld) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, ByteOffset, result);
+    RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
 
     return result;
 }
@@ -2140,43 +2202,11 @@ NTSTATUS DOKAN_CALLBACK MileCirnoSetAllocationSize(
     _In_ LONGLONG AllocSize,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
-    NTSTATUS result = STATUS_SUCCESS;
+    UNREFERENCED_PARAMETER(FileName);
+    UNREFERENCED_PARAMETER(AllocSize);
+    UNREFERENCED_PARAMETER(DokanFileInfo);
 
-    std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
-
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called SetAllocationSize(FileId = %u, FileName = %s, AllocSize = %lld) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, AllocSize, result);
-
-    return result;
-}
-
-NTSTATUS DOKAN_CALLBACK MileCirnoLockFile(
-    _In_ LPCWSTR FileName,
-    _In_ LONGLONG ByteOffset,
-    _In_ LONGLONG Length,
-    _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
-{
-    NTSTATUS result = STATUS_SUCCESS;
-
-    std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
-
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called LockFile(FileId = %u, FileName = %s, ByteOffset = %lld, Length = %lld) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, ByteOffset, Length, result);
-
-    return result;
-}
-
-NTSTATUS DOKAN_CALLBACK MileCirnoUnlockFile(
-    _In_ LPCWSTR FileName,
-    _In_ LONGLONG ByteOffset,
-    _In_ LONGLONG Length,
-    _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
-{
-    NTSTATUS result = STATUS_SUCCESS;
-
-    std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
-
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called UnlockFile(FileId = %u, FileName = %s, ByteOffset = %lld, Length = %lld) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, ByteOffset, Length, result);
-
-    return result;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS DOKAN_CALLBACK MileCirnoGetDiskFreeSpace(
@@ -2186,6 +2216,8 @@ NTSTATUS DOKAN_CALLBACK MileCirnoGetDiskFreeSpace(
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
     UNREFERENCED_PARAMETER(DokanFileInfo);
+
+    auto start_time = std::chrono::steady_clock::now();
 
     try
     {
@@ -2205,11 +2237,14 @@ NTSTATUS DOKAN_CALLBACK MileCirnoGetDiskFreeSpace(
             *TotalNumberOfFreeBytes = Response.BlockSize * Response.FreeBlocks;
         }
     }
-    catch (std::exception const& ex)
+    catch (...)
     {
-        Log(EVENTLOG_WARNING_TYPE, DebugData, L"StatFsException: %hs", ex.what());
+        RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
+
         return STATUS_NOT_IMPLEMENTED;
     }
+
+    RecordBenchmarkData(__FUNCTION__, std::chrono::steady_clock::now() - start_time);
 
     return STATUS_SUCCESS;
 }
@@ -2261,17 +2296,13 @@ NTSTATUS DOKAN_CALLBACK MileCirnoGetFileSecurityW(
     _Out_ PULONG LengthNeeded,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
+    UNREFERENCED_PARAMETER(FileName);
+    UNREFERENCED_PARAMETER(SecurityInformation);
     UNREFERENCED_PARAMETER(SecurityDescriptor);
     UNREFERENCED_PARAMETER(BufferLength);
     UNREFERENCED_PARAMETER(LengthNeeded);
+    UNREFERENCED_PARAMETER(DokanFileInfo);
 
-    // Get the file ID
-    std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
-
-    // Log the call
-    Log(EVENTLOG_INFORMATION_TYPE, HeavyTraces, L"%s (PID = %u) called GetFileSecurityW(FileId = %u, FileName = %s, SecurityInformation = %s)", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, GetSecurityInformationString(SecurityInformation != NULL ? *SecurityInformation : 0).c_str());
-
-    // Let Dokan generate a caller-specific security descriptor
     return STATUS_NOT_IMPLEMENTED;
 }
 
@@ -2282,19 +2313,13 @@ NTSTATUS DOKAN_CALLBACK MileCirnoSetFileSecurityW(
     _In_ ULONG BufferLength,
     _Inout_ PDOKAN_FILE_INFO DokanFileInfo)
 {
+    UNREFERENCED_PARAMETER(FileName);
     UNREFERENCED_PARAMETER(SecurityInformation);
     UNREFERENCED_PARAMETER(SecurityDescriptor);
     UNREFERENCED_PARAMETER(BufferLength);
+    UNREFERENCED_PARAMETER(DokanFileInfo);
 
-    NTSTATUS result = STATUS_SUCCESS;
-
-    std::uint32_t FileId = static_cast<std::uint32_t>(DokanFileInfo->Context);
-
-    SECURITY_INFORMATION securityInformation = SecurityInformation != NULL ? *SecurityInformation : 0;
-
-    Log(result == STATUS_SUCCESS ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, HeavyTraces, L"%s (PID = %u) called SetFileSecurityW(FileId = %u, FileName = %s, SecurityInformation = %s) with a result of 0x%08X", GetProcessName(DokanFileInfo->ProcessId).c_str(), DokanFileInfo->ProcessId, FileId, FileName, GetSecurityInformationString(securityInformation).c_str(), result);
-
-    return result;
+    return STATUS_SUCCESS;
 }
 
 int main()
@@ -2306,7 +2331,6 @@ int main()
     bool Mount = false;
     std::string Host;
     std::string Port;
-    std::string MountPoint;
     std::string ReadOnly;
     std::string CaseSensitive;
 
@@ -2320,7 +2344,7 @@ int main()
             Host = Arguments[3];
             Port = Arguments[4];
             g_AccessName = Arguments[5];
-            MountPoint = Arguments[6];
+            g_MountPoint = Arguments[6];
             ReadOnly = Arguments[7];
             CaseSensitive = Arguments[8];
         }
@@ -2332,7 +2356,7 @@ int main()
             Host = "HvSocket";
             Port = Arguments[3];
             g_AccessName = Arguments[4];
-            MountPoint = Arguments[5];
+            g_MountPoint = Arguments[5];
             ReadOnly = Arguments[6];
             CaseSensitive = Arguments[7];
         }
@@ -2343,7 +2367,7 @@ int main()
         {
             ParseSuccess = true;
             Mount = false;
-            MountPoint = Arguments[2];
+            g_MountPoint = Arguments[2];
         }
     }
 
@@ -2370,7 +2394,7 @@ int main()
 
                 ::DokanShutdown();
 
-                ::DokanRemoveMountPoint(Mile::ToWideString(CP_UTF8, MountPoint).c_str());
+                ::DokanRemoveMountPoint(Mile::ToWideString(CP_UTF8, g_MountPoint).c_str());
             });
 
         ::DokanInit();
@@ -2380,7 +2404,6 @@ int main()
             int WSAError = ::WSAStartup(MAKEWORD(2, 2), &WSAData);
             if (NO_ERROR != WSAError)
             {
-                Log(EVENTLOG_ERROR_TYPE, DebugData, L"WSAStartup failed (%d).", WSAError);
                 return -1;
             }
         }
@@ -2413,11 +2436,6 @@ int main()
                     Mile::Cirno::DefaultProtocolVersion;
                 Mile::Cirno::VersionResponse Response =
                     g_Instance->Version(Request);
-                Log(EVENTLOG_INFORMATION_TYPE, DebugData,
-                    L"Response.ProtocolVersion = %hs\n"
-                    L"Response.MaximumMessageSize = %u",
-                    Response.ProtocolVersion.c_str(),
-                    Response.MaximumMessageSize);
             }
 
             {
@@ -2429,18 +2447,14 @@ int main()
                 Request.NumericUserName = MILE_CIRNO_NONUNAME;
                 Mile::Cirno::AttachResponse Response = g_Instance->Attach(Request);
                 g_RootDirectoryFileId = Request.FileId;
-                Log(EVENTLOG_INFORMATION_TYPE, DebugData,
-                    L"Response.UniqueId.Path = 0x%016llX",
-                    Response.UniqueId.Path);
             }
         }
-        catch (std::exception const& ex)
+        catch (...)
         {
-            Log(EVENTLOG_WARNING_TYPE, DebugData, L"AttachException: %hs", ex.what());
             return -1;
         }
 
-        std::wstring ConvertedMountPoint = Mile::ToWideString(CP_UTF8, MountPoint);
+        std::wstring ConvertedMountPoint = Mile::ToWideString(CP_UTF8, g_MountPoint);
 
         g_Options.Version = DOKAN_VERSION;
         g_Options.SingleThread;
@@ -2454,7 +2468,7 @@ int main()
         g_Options.Timeout = INFINITE;
         g_Options.AllocationUnitSize;
         g_Options.SectorSize;
-        g_Options.VolumeSecurityDescriptorLength; // I think we need to return a proper descriptor here for Steam to work without "Run as administrator"
+        g_Options.VolumeSecurityDescriptorLength;
         g_Options.VolumeSecurityDescriptor;
 
         DOKAN_OPERATIONS Operations = { 0 };
@@ -2466,7 +2480,6 @@ int main()
         Operations.FlushFileBuffers = ::MileCirnoFlushFileBuffers;
         Operations.GetFileInformation = ::MileCirnoGetFileInformation;
         Operations.FindFiles = ::MileCirnoFindFiles;
-        Operations.FindFilesWithPattern = nullptr;
         Operations.SetFileAttributesW = ::MileCirnoSetFileAttributesW;
         Operations.SetFileTime = ::MileCirnoSetFileTime;
         Operations.DeleteFileW = ::MileCirnoDeleteFileW;
@@ -2474,12 +2487,8 @@ int main()
         Operations.MoveFileW = ::MileCirnoMoveFileW;
         Operations.SetEndOfFile = ::MileCirnoSetEndOfFile;
         Operations.SetAllocationSize = ::MileCirnoSetAllocationSize;
-        Operations.LockFile = ::MileCirnoLockFile;
-        Operations.UnlockFile = ::MileCirnoUnlockFile;
         Operations.GetDiskFreeSpaceW = ::MileCirnoGetDiskFreeSpace;
         Operations.GetVolumeInformationW = ::MileCirnoGetVolumeInformationW;
-        Operations.Mounted;
-        Operations.Unmounted;
         Operations.GetFileSecurityW = ::MileCirnoGetFileSecurityW;
         Operations.SetFileSecurityW = ::MileCirnoSetFileSecurityW;
         Operations.FindStreams;
@@ -2487,6 +2496,6 @@ int main()
     }
     else
     {
-        ::DokanRemoveMountPoint(Mile::ToWideString(CP_UTF8, MountPoint).c_str());
+        ::DokanRemoveMountPoint(Mile::ToWideString(CP_UTF8, g_MountPoint).c_str());
     }
 }
